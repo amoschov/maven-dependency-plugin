@@ -33,14 +33,18 @@ import org.apache.maven.plugin.MojoFailureException;
 import org.apache.maven.plugin.dependency.AbstractDependencyMojo;
 import org.apache.maven.plugin.dependency.utils.DependencyUtil;
 import org.apache.maven.plugin.dependency.utils.filters.ArtifactItemFilter;
+import org.apache.maven.plugin.dependency.utils.resolvers.ArtifactsResolver;
+import org.apache.maven.plugin.dependency.utils.resolvers.DefaultArtifactsResolver;
 import org.apache.maven.plugins.annotations.Component;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.project.MavenProject;
 import org.apache.maven.shared.artifact.filter.collection.ArtifactFilterException;
+import org.codehaus.plexus.util.FileUtils;
 import org.codehaus.plexus.util.StringUtils;
 
 import java.io.File;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -125,6 +129,13 @@ public abstract class AbstractFromConfigurationMojo
     @Component
     private ArtifactFactory artifactFactory;
 
+    /**
+     * Used to look up Artifacts in the remote repository.
+     *
+     * @component
+     */
+    protected org.apache.maven.artifact.resolver.ArtifactResolver artifactResolver;
+    
     abstract ArtifactItemFilter getMarkedArtifactFilter( ArtifactItem item );
     
     // artifactItems is filled by either field injection or by setArtifact()
@@ -243,38 +254,148 @@ public abstract class AbstractFromConfigurationMojo
 
         // Maven 3 will search the reactor for the artifact but Maven 2 does not
         // to keep consistent behaviour, we search the reactor ourselves.
+        getLog().debug("Looking Artifact from reactor ...");
         Artifact result = getArtifactFomReactor( artifact );
         if ( result != null )
         {
+            getLog().debug("Found Artifact from reactor " + result);
             return result;
         }
-
+        
+        getLog().debug("Resolving artifact ... " + artifact);
         try
         {
             // mdep-50 - rolledback for now because it's breaking some functionality.
             /*
-             * List listeners = new ArrayList(); Set theSet = new HashSet(); theSet.add( artifact );
-             * ArtifactResolutionResult artifactResolutionResult = artifactCollector.collect( theSet, project
-             * .getArtifact(), managedVersions, this.local, project.getRemoteArtifactRepositories(),
-             * artifactMetadataSource, null, listeners ); Iterator iter =
-             * artifactResolutionResult.getArtifactResolutionNodes().iterator(); while ( iter.hasNext() ) {
-             * ResolutionNode node = (ResolutionNode) iter.next(); artifact = node.getArtifact(); }
-             */
+            List listeners = new ArrayList();
+            Set theSet = new HashSet();
+            theSet.add(artifact);
+            ArtifactResolutionResult artifactResolutionResult = artifactCollector.collect(theSet, project.getArtifact(), managedVersions, this.local,
+                project.getRemoteArtifactRepositories(), artifactMetadataSource, null, listeners);
+            Iterator iter = artifactResolutionResult.getArtifactResolutionNodes().iterator();
+            while (iter.hasNext()) {
+                ResolutionNode node = (ResolutionNode) iter.next();
+                artifact = node.getArtifact();
+            }*/             
+
+            getLog().debug("Using remotes :  " + remoteRepos +"; Using local :"+ getLocal());
 
             resolver.resolve( artifact, remoteRepos, getLocal() );
+            getLog().debug("Artifact isResolved  :  " + artifact.isResolved()+  "; File:"+ artifact.getFile() + ", isDir=" + artifact.getFile().isDirectory());
+
+
+            File file = artifact.getFile();
+            if (!file.exists()) {
+                getLog().debug("ArtifactFile does not exists " + file + ". Trying to resolve ...");
+                file = new File(getLocal().getBasedir(), getLocal().pathOf(artifact));
+            }
+            
+            //When using maven under eclipse the artifact will by default point to a directory, which isn't correct.
+            //To work around this we'll first try to get the archive from the local repo, and only if it isn't found there we'll do a normal resolve.
+            if (file.isDirectory()) {
+                getLog().debug("ArtifactFile is Directory  " + file + ". Trying to resolve in Eclipse Workspace...");
+
+                File artifactFile = new File(file.getParentFile(),getArtifactFileName(artifact,false));
+                getLog().info(String.format("Checking artifact in Eclipse Workspace \"%s\"", artifactFile));
+                if (!artifactFile.exists()) {                                                                       
+                    artifactFile = new File(file.getParentFile(),artifactItem.getDestFileName());
+                    getLog().info(String.format("Checking artifact in Eclipse Workspace using ArtifactItem.DestFileName \"%s\"", artifactFile));
+                    if (!artifactFile.exists()) {
+                        artifactFile = new File(file,artifactItem.getDestFileName());
+                        getLog().info(String.format("Checking artifact in Eclipse Workspace Classes using ArtifactItem.DestFileName \"%s\"", artifactFile));
+                    }    
+
+                    if (!artifactFile.exists()) {
+                        final List<File> list = FileUtils.getFiles(file.getParentFile(), "*." + artifact.getArtifactHandler().getExtension(), null);
+                        if (list != null && list.size() > 0) {
+                            if (list.size() > 1) {
+                                getLog().warn(String.format("Found a set of candidate \"%s\"", list));
+                            }    
+                            artifactFile = list.get(0);
+                        }
+                    }
+                    
+                    if (!artifactFile.exists()) {
+                        getLog().warn(String.format("Couldn't resolve artifact in Eclipse Workspace \"%s\", looking to local and remote repositories ...", artifact));
+                        file = resolveArtifactToFile(artifact);
+                    }
+                    else {
+                        file = artifactFile;
+                        
+                    }
+                }
+                else {
+                    file = artifactFile;
+                }
+                
+                if (file != null) {
+                    artifact.setFile(file);
+                }
+                
+            }
         }
-        catch ( ArtifactResolutionException e )
-        {
-            throw new MojoExecutionException( "Unable to resolve artifact.", e );
+        catch (ArtifactResolutionException e) {
+            getLog().error("Could not to resolve artifact" + artifact ,e);
+            throw new MojoExecutionException("Unable to resolve artifact.", e);
         }
-        catch ( ArtifactNotFoundException e )
-        {
-            throw new MojoExecutionException( "Unable to find artifact.", e );
+        catch (ArtifactNotFoundException e) {
+            getLog().error("Could not to resolve artifact" + artifact ,e);
+            throw new MojoExecutionException("Unable to find artifact.", e);
+        }
+        catch (MojoExecutionException e) {
+            getLog().error("Could not to resolve artifact" + artifact ,e);
+            throw e;
+        }
+        catch (Exception e) {
+            getLog().error("Could not to resolve artifact " + artifact ,e);
+            return artifact;
         }
 
+        getLog().info("Artifact " + artifact + " resolved to " + artifact.getFile());
         return artifact;
     }
+    
+    /**
+     * Attempts to resolve an {@link Artifact} to a {@link File}.
+     *
+     * @param artifact to resolve
+     * @return a {@link File} to the resolved artifact, never <code>null</code>.
+     * @throws MojoExecutionException if the artifact could not be resolved.
+     */
+    protected File resolveArtifactToFile(Artifact artifact) throws MojoExecutionException {
+        final ArtifactsResolver artifactsResolver = new DefaultArtifactsResolver(this.artifactResolver, getLocal(), getRemoteRepos(), true);
+        final HashSet<Artifact> artifacts = new HashSet<Artifact>();
+        artifacts.add(artifact);
+        File jar = null;
+        final Set<Artifact> resolvedArtifacts = artifactsResolver.resolve(artifacts, getLog());
+        for (Artifact resolvedArtifact : resolvedArtifacts) {
+            jar = resolvedArtifact.getFile();
+        }
+        if (jar == null) {
+            throw new MojoExecutionException("Could not resolve artifact " + artifact.getId() + ". Please install it with \"mvn install:install-file ...\" or deploy it to a repository with \"mvn deploy:deploy-file ...\"");
+        }
 
+        return jar;
+    }    
+
+    private static String getArtifactFileName(Artifact artifact, boolean removeVersion) {
+
+        String versionString = null;
+        if (!removeVersion) {
+            versionString = "-" + artifact.getVersion();
+        } else {
+            versionString = "";
+        }
+
+        String classifierString = "";
+
+        if (StringUtils.isNotEmpty(artifact.getClassifier())) {
+            classifierString = "-" + artifact.getClassifier();
+        }
+
+        return artifact.getArtifactId() + versionString + classifierString + "." + artifact.getArtifactHandler().getExtension();
+    }    
+    
     /**
      * Checks to see if the specified artifact is available from the reactor.
      *
